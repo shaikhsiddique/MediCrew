@@ -5,7 +5,6 @@ from collections import Counter
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
-from imblearn.over_sampling import SMOTE
 
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
@@ -14,8 +13,7 @@ from tensorflow.keras.layers import (
     Dropout, Flatten, Dense
 )
 from tensorflow.keras.utils import to_categorical
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-import joblib
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 
 print("🚀 Training 1D-CNN model...")
 
@@ -26,13 +24,93 @@ CLASS_NAMES = [
 ]
 
 # ───────────────────────────────────────────────────────────────
-# FIX SIGNAL LENGTH → 187
+# FIX 1: resample_to_187 — replaces fix_length()
+#
+# OLD: fix_length() truncated to first 187 samples = only 0.37 s
+#      of a 5-second signal. The CNN never saw a full rhythm.
+#      Zero-padding made the rest of the signal flat zeros.
+#
+# NEW: interpolate the full signal down to 187 points, identical
+#      to what prepare_model_input() does in main.py at inference.
+#      Train/inference now see the same shape of signal.
 # ───────────────────────────────────────────────────────────────
-def fix_length(signal, target_len=187):
-    if len(signal) > target_len:
-        return signal[:target_len]
-    else:
-        return np.pad(signal, (0, target_len - len(signal)))
+def resample_to_187(signal, target_len=187):
+    signal = np.asarray(signal, dtype=np.float64).reshape(-1)
+    if len(signal) == target_len:
+        return signal.astype(np.float32)
+    if len(signal) < 2:
+        return np.repeat(signal.astype(np.float32), target_len)
+    x_old = np.arange(len(signal), dtype=np.float64)
+    x_new = np.linspace(0, len(signal) - 1, target_len)
+    return np.interp(x_new, x_old, signal).astype(np.float32)
+
+
+# ───────────────────────────────────────────────────────────────
+# FIX 2: z-score normalization — must match inference
+#
+# OLD: no normalization applied during training.
+# NEW: (x - mean) / std matches prepare_model_input() in main.py.
+#      Without this, the model trains on raw amplitude values but
+#      gets z-scored inputs at runtime — completely different scale.
+# ───────────────────────────────────────────────────────────────
+def normalize(signal):
+    signal = np.asarray(signal, dtype=np.float32)
+    return (signal - signal.mean()) / (signal.std() + 1e-8)
+
+
+def prepare(signal):
+    return normalize(resample_to_187(signal))
+
+
+# ───────────────────────────────────────────────────────────────
+# FIX 3: ECG-aware augmentation — replaces SMOTE
+#
+# OLD: SMOTE interpolated between pairs of signals to generate
+#      synthetic samples. For VFib (chaotic oscillations), averaging
+#      two chaotic signals creates blurry patterns that look like
+#      neither VFib nor AFib — the CNN learned a fuzzy boundary.
+#
+# NEW: physiologically realistic transforms:
+#      - amplitude scaling  (simulates lead placement variation)
+#      - gaussian noise     (simulates electrode noise)
+#      - baseline wander    (simulates breathing artifact)
+#      - time shift / roll  (simulates different R-peak alignment)
+#      Each augmented signal is re-normalized after transforms.
+# ───────────────────────────────────────────────────────────────
+def augment_signal(x, rng):
+    x = x.copy()
+    x *= rng.uniform(0.85, 1.15)
+    x += rng.normal(0, rng.uniform(0.01, 0.04), size=x.shape)
+    freq  = rng.uniform(0.1, 0.5)
+    phase = rng.uniform(0, 2 * np.pi)
+    amp   = rng.uniform(0.01, 0.05)
+    t     = np.linspace(0, 1, len(x))
+    x    += amp * np.sin(2 * np.pi * freq * t + phase)
+    x     = np.roll(x, rng.integers(-10, 11))
+    return normalize(x)
+
+
+def oversample_with_augmentation(X, y, seed=42):
+    rng = np.random.default_rng(seed)
+    counts = Counter(y.tolist())
+    majority_count = counts.most_common(1)[0][1]
+
+    X_out, y_out = [X.copy()], [y.copy()]
+    for cls, n_have in counts.items():
+        n_need = majority_count - n_have
+        if n_need <= 0:
+            continue
+        print(f"  class {cls}: {n_have} real → +{n_need} augmented")
+        idx     = np.where(y == cls)[0]
+        chosen  = idx[rng.integers(0, n_have, size=n_need)]
+        aug     = np.stack([augment_signal(X[i], rng) for i in chosen])
+        X_out.append(aug)
+        y_out.append(np.full(n_need, cls, dtype=y.dtype))
+
+    X_all = np.concatenate(X_out)
+    y_all = np.concatenate(y_out)
+    perm  = rng.permutation(len(X_all))
+    return X_all[perm], y_all[perm]
 
 
 # ───────────────────────────────────────────────────────────────
@@ -43,26 +121,21 @@ def load_data(path: str):
 
     df = pd.read_csv(path)
 
-    X = df["signal"].apply(ast.literal_eval)
-    X = np.array(X.tolist(), dtype=np.float32)
-    X = np.array([fix_length(s) for s in X], dtype=np.float32)
+    label_map = {"Normal": 0, "AFib": 1, "VFib": 2}
+    df = df[df["label"].isin(label_map)].reset_index(drop=True)
+
+    # FIX 1 + 2: resample then z-score — matches inference pipeline
+    X = np.stack([prepare(np.array(ast.literal_eval(s))) for s in df["signal"]])
+    y = df["label"].map(label_map).values
 
     print(f"✅ Signal shape after fix: {X.shape}")
-
-    label_map = {
-        "Normal": 0,
-        "AFib":   1,
-        "VFib":   2
-    }
-
-    y = df["label"].map(label_map).values
-    print(f"📊 Original distribution: {Counter(y)}")
+    print(f"📊 Original distribution: {Counter(y.tolist())}")
 
     return X, y
 
 
 # ───────────────────────────────────────────────────────────────
-# BUILD 1D-CNN MODEL
+# BUILD 1D-CNN MODEL  (unchanged)
 # ───────────────────────────────────────────────────────────────
 def build_cnn(input_len=187, num_classes=3):
     model = Sequential([
@@ -95,7 +168,7 @@ def build_cnn(input_len=187, num_classes=3):
     ])
 
     model.compile(
-        optimizer="adam",
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
         loss="categorical_crossentropy",
         metrics=["accuracy"]
     )
@@ -109,44 +182,52 @@ def build_cnn(input_len=187, num_classes=3):
 def train():
     X, y = load_data("data/ecg_dataset_test.csv")
 
-    # Split first
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y
     )
 
-    print(f"\nBefore SMOTE: {Counter(y_train)}")
+    print(f"\nBefore augmentation: {Counter(y_train.tolist())}")
 
-    # SMOTE only on training data
-    smote = SMOTE(random_state=42)
-    X_train_sm, y_train_sm = smote.fit_resample(X_train, y_train)
+    # FIX 3: augmentation instead of SMOTE
+    X_train, y_train = oversample_with_augmentation(X_train, y_train)
 
-    print(f"After SMOTE:  {Counter(y_train_sm)}")
-    print(f"Test dist:    {Counter(y_test)}")
+    print(f"After augmentation:  {Counter(y_train.tolist())}")
+    print(f"Test dist:           {Counter(y_test.tolist())}")
 
     # Reshape for CNN → (samples, timesteps, channels)
-    X_train_cnn = X_train_sm.reshape(-1, 187, 1)
+    X_train_cnn = X_train.reshape(-1, 187, 1)
     X_test_cnn  = X_test.reshape(-1, 187, 1)
 
     # One-hot encode labels
-    y_train_cat = to_categorical(y_train_sm, num_classes=3)
-    y_test_cat  = to_categorical(y_test,     num_classes=3)
+    y_train_cat = to_categorical(y_train, num_classes=3)
+    y_test_cat  = to_categorical(y_test,  num_classes=3)
 
     # Build model
     model = build_cnn(input_len=187, num_classes=3)
     model.summary()
 
-    # Callbacks
+    # FIX 4: monitor val_loss not val_accuracy
+    # val_accuracy stays high even when VFib recall quietly drops
+    # because Normal + AFib dominate the test set numerically.
+    # val_loss catches VFib degradation that accuracy misses.
     callbacks = [
         EarlyStopping(
-            monitor="val_accuracy",
+            monitor="val_loss",
             patience=10,
             restore_best_weights=True,
             verbose=1
         ),
         ModelCheckpoint(
             filepath="models/model_mitbih_cnn.keras",
-            monitor="val_accuracy",
+            monitor="val_loss",
             save_best_only=True,
+            verbose=1
+        ),
+        ReduceLROnPlateau(
+            monitor="val_loss",
+            factor=0.5,
+            patience=5,
+            min_lr=1e-6,
             verbose=1
         )
     ]
@@ -174,8 +255,12 @@ def train():
     print("📄 Classification Report:")
     print(classification_report(y_test, y_pred, target_names=CLASS_NAMES))
 
-    print("📉 Confusion Matrix:")
-    print(confusion_matrix(y_test, y_pred))
+    # FIX 4: confusion matrix with labels so VFib recall is obvious
+    print("📉 Confusion Matrix (rows=true, cols=pred):")
+    print("              Normal  AFib  VFib")
+    cm = confusion_matrix(y_test, y_pred)
+    for i, row in enumerate(cm):
+        print(f"  {CLASS_NAMES[i][:6]:6s}  {row}")
 
     # Save final model
     model.save("models/model_mitbih_cnn.keras")
